@@ -1,3 +1,5 @@
+const API_URL = import.meta.env.VITE_API_URL;
+
 export const verifyDocument = async (docType, number, file) => {
   try {
     const formData = new FormData();
@@ -5,14 +7,13 @@ export const verifyDocument = async (docType, number, file) => {
     formData.append("number", number);
     formData.append("file", file);
 
-    const response = await fetch("http://127.0.0.1:8000/verify", {
+    const response = await fetch(`${API_URL}/verify`, {
       method: "POST",
       body: formData
     });
 
     if (!response.ok) throw new Error("Network response not ok");
-    const data = await response.json();
-    return data;
+    return await response.json();
 
   } catch (error) {
     console.error("Verification error:", error);

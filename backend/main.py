@@ -3,12 +3,23 @@ import pytesseract
 from PIL import Image
 import cv2
 import tempfile
-from fastapi import FastAPI, UploadFile, File, Form
+from fastapi import FastAPI, UploadFile, File, Form, Request
 from fastapi.middleware.cors import CORSMiddleware
-import logging
+from pydantic import BaseModel
 from datetime import datetime
+import logging
+import os
+import httpx
+import random
 
-# Path to tesseract executable
+from dotenv import load_dotenv
+from cryptography.fernet import Fernet
+from fastapi.responses import JSONResponse
+
+# Load environment variables from vite-project/.env
+load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), "../vite-project/.env"))
+
+# Path to tesseract executable (Windows)
 pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
 
 app = FastAPI()
@@ -22,24 +33,20 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Strict Regex patterns
-aadhaar_pattern = re.compile(r"^\d{4}\s\d{4}\s\d{4}$")   # Aadhaar strictly "XXXX XXXX XXXX"
-pan_pattern = re.compile(r"^[A-Z]{5}[0-9]{4}[A-Z]$")     # PAN strictly "ABCDE1234F"
-apaar_pattern = re.compile(r"^\d{12}$")                  # APAAR strictly "123456789012"
+# ========== OCR Regex Patterns ==========
+aadhaar_pattern = re.compile(r"^\d{4}\s\d{4}\s\d{4}$")
+pan_pattern = re.compile(r"^[A-Z]{5}[0-9]{4}[A-Z]$")
+apaar_pattern = re.compile(r"^\d{12}$")
 
-# Enhanced patterns for APAAR document details extraction
+# Cleaner name extraction – avoids DOB/date contamination
 name_patterns = [
-    re.compile(r"(?:name|full name|नाम|फुल नेम)[:;\s]*([a-zA-Z\s]+)", re.IGNORECASE),
-    re.compile(r"^([A-Z][a-z]+\s[A-Z][a-z]+)$"),  # First Last format
-    re.compile(r"^([A-Z][a-z]+\s[A-Z][a-z]+\s[A-Z][a-z]+)$"),  # First Middle Last format
+    re.compile(r"(?:name|full name|नाम|फुल नेम)[:;\s]*([A-Za-z\s]+)", re.IGNORECASE),
+    re.compile(r"^([A-Z][a-z]+(?:\s[A-Z][a-z]+){1,2})$"),  # first last / first middle last
 ]
 
-# Date of birth patterns (instead of age)
 dob_patterns = [
-    re.compile(r"(?:date of birth|dob|जन्म तिथि|जन्म की तारीख)[:;\s]*([0-9]{1,2}[/\-\.][0-9]{1,2}[/\-\.][0-9]{4})", re.IGNORECASE),
-    re.compile(r"(?:dob|जन्म)[:;\s]*([0-9]{1,2}[/\-\.][0-9]{1,2}[/\-\.][0-9]{4})", re.IGNORECASE),
-    re.compile(r"\b([0-9]{1,2}[/\-\.][0-9]{1,2}[/\-\.][0-9]{4})\b"),
-    re.compile(r"\b([0-9]{4}[/\-\.][0-9]{1,2}[/\-\.][0-9]{1,2})\b"),  # YYYY-MM-DD format
+    re.compile(r"\b([0-9]{1,2}[/\-\.][0-9]{1,2}[/\-\.][0-9]{2,4})\b"),
+    re.compile(r"\b([0-9]{4}[/\-\.][0-9]{1,2}[/\-\.][0-9]{1,2})\b"),
 ]
 
 gender_patterns = [
@@ -47,237 +54,207 @@ gender_patterns = [
     re.compile(r"\b(male|female|transgender|m|f|t)\b", re.IGNORECASE),
 ]
 
+# ========== Helpers ==========
 def format_date_to_dd_mm_yyyy(date_str):
-    """Convert various date formats to DD/MM/YYYY format"""
-    date_formats = [
+    formats = [
         '%d/%m/%Y', '%d-%m-%Y', '%d.%m.%Y',
         '%m/%d/%Y', '%m-%d-%Y', '%m.%d.%Y',
         '%Y/%m/%d', '%Y-%m-%d', '%Y.%m.%d',
-        '%d/%m/%y', '%d-%m-%y', '%d.%m.%y',  # 2-digit year
+        '%d/%m/%y', '%d-%m-%y', '%d.%m.%y',
     ]
-    
-    for fmt in date_formats:
+    for fmt in formats:
         try:
-            date_obj = datetime.strptime(date_str, fmt)
-            # Convert to DD/MM/YYYY format with leading zeros
-            return date_obj.strftime('%d/%m/%Y')
+            return datetime.strptime(date_str, fmt).strftime('%d/%m/%Y')
         except ValueError:
             continue
-    
-    # If we can't parse it, try to extract components manually
-    parts = re.split(r'[/\-\.]', date_str)
-    if len(parts) == 3:
-        day, month, year = parts
-        
-        # Ensure year is 4 digits
-        if len(year) == 2:
-            year = f"20{year}"  # Assuming 21st century
-        
-        # Ensure day and month are 2 digits
-        day = day.zfill(2)
-        month = month.zfill(2)
-        
-        # Validate the date components
-        try:
-            datetime.strptime(f"{day}/{month}/{year}", '%d/%m/%Y')
-            return f"{day}/{month}/{year}"
-        except ValueError:
-            pass
-    
-    return date_str  # Return as-is if cannot parse
+    return date_str
 
-def extract_apaar_details(text):
-    """Enhanced function to extract details from APAAR document text"""
-    details = {}
-    lines = [line.strip() for line in text.split('\n') if line.strip()]
-    
-    # Try to extract name using multiple patterns
-    for pattern in name_patterns:
-        name_match = pattern.search(text)
-        if name_match:
-            potential_name = name_match.group(1).strip()
-            # Basic validation - name should have at least two words and reasonable length
-            if len(potential_name.split()) >= 2 and 4 <= len(potential_name) <= 50:
-                details['name'] = potential_name
-                break
-    
-    # If no name found with patterns, try line-by-line analysis for APAAR
-    if 'name' not in details:
-        for i, line in enumerate(lines):
-            # Look for lines that might contain a name (mixed case, reasonable length)
-            if (any(keyword in line.lower() for keyword in ['name', 'नाम']) or 
-                (60 > len(line) > 8 and re.match(r'^[A-Za-z\s]+$', line) and 
-                 sum(1 for c in line if c.isupper()) >= 2)):
-                details['name'] = line
-                break
-    
-    # Try to extract date of birth (instead of age)
-    for pattern in dob_patterns:
-        dob_match = pattern.search(text)
-        if dob_match:
-            dob_str = dob_match.group(1).strip()
-            details['dob'] = format_date_to_dd_mm_yyyy(dob_str)
-            break
-    
-    # If no DOB found with patterns, look for date-like patterns in the text
-    if 'dob' not in details:
-        # Look for common date formats with 4-digit year
-        date_matches = re.findall(r'\b(\d{1,2}[/\-\.]\d{1,2}[/\-\.]\d{4})\b', text)
-        for date_str in date_matches:
-            # Simple validation - check if it looks like a date
-            if any(sep in date_str for sep in ['/', '-', '.']):
-                details['dob'] = format_date_to_dd_mm_yyyy(date_str)
-                break
-    
-    # Try to extract gender
-    for pattern in gender_patterns:
-        gender_match = pattern.search(text)
-        if gender_match:
-            gender = gender_match.group(1).lower()
-            if gender in ['male', 'm', 'पुरुष']:
-                details['gender'] = 'Male'
-            elif gender in ['female', 'f', 'महिला', 'स्त्री']:
-                details['gender'] = 'Female'
-            else:
-                details['gender'] = 'Other'
-            break
-    
-    # If no gender found with patterns, look for gender keywords in context
-    if 'gender' not in details:
-        for i, line in enumerate(lines):
-            lower_line = line.lower()
-            if any(keyword in lower_line for keyword in ['male', 'female', 'transgender', 'पुरुष', 'महिला']):
-                if 'male' in lower_line or 'पुरुष' in lower_line:
-                    details['gender'] = 'Male'
-                elif 'female' in lower_line or 'महिला' in lower_line or 'स्त्री' in lower_line:
-                    details['gender'] = 'Female'
-                break
-    
-    return details
+def clean_text_lines(text):
+    """Normalize OCR text line by line"""
+    lines = []
+    for l in text.split("\n"):
+        l = l.strip()
+        if not l:
+            continue
+        l = re.sub(r"[^A-Za-z0-9\s:/\-\.]", "", l)  # remove weird chars
+        l = re.sub(r"\s+", " ", l)  # normalize spaces
+        lines.append(l)
+    return lines
 
-def extract_aadhaar_details(text):
-    """Extract only name, DOB and gender from Aadhaar card text"""
+def extract_fields(lines):
     details = {}
-    
-    # Try to extract name
-    for pattern in name_patterns:
-        name_match = pattern.search(text)
-        if name_match:
-            details['name'] = name_match.group(1).strip()
+
+    # NAME extraction
+    for l in lines:
+        if any(x in l.lower() for x in ["dob", "date", "birth", "gender"]):
+            continue  # avoid contaminating with DOB/Gender lines
+        for pattern in name_patterns:
+            m = pattern.search(l)
+            if m:
+                details["name"] = m.group(1).strip()
+                break
+        if "name" in details:
             break
-    
-    # Try to extract date of birth
-    for pattern in dob_patterns:
-        dob_match = pattern.search(text)
-        if dob_match:
-            dob_str = dob_match.group(1).strip()
-            details['dob'] = format_date_to_dd_mm_yyyy(dob_str)
+
+    # DOB extraction
+    for l in lines:
+        for pattern in dob_patterns:
+            m = pattern.search(l)
+            if m:
+                details["dob"] = format_date_to_dd_mm_yyyy(m.group(1).strip())
+                break
+        if "dob" in details:
             break
-    
-    # Try to extract gender
-    for pattern in gender_patterns:
-        gender_match = pattern.search(text)
-        if gender_match:
-            gender = gender_match.group(1).lower()
-            if gender in ['male', 'm', 'पुरुष']:
-                details['gender'] = 'Male'
-            elif gender in ['female', 'f', 'महिला', 'स्त्री']:
-                details['gender'] = 'Female'
-            else:
-                details['gender'] = 'Other'
+
+    # Gender extraction
+    for l in lines:
+        for pattern in gender_patterns:
+            m = pattern.search(l)
+            if m:
+                g = m.group(1).lower()
+                details['gender'] = 'Male' if g in ['male','m','पुरुष'] else 'Female' if g in ['female','f','महिला','स्त्री'] else 'Other'
+                break
+        if "gender" in details:
             break
-    
+
     return details
 
 def extract_details(text, doc_type):
-    """Extract details from document text based on document type"""
-    if doc_type.lower() == "apaar":
-        return extract_apaar_details(text)
-    elif doc_type.lower() == "aadhaar":
-        return extract_aadhaar_details(text)
-    elif doc_type.lower() == "pan":
-        # Return empty details for PAN cards
-        return {}
-    
-    # For unknown document types, return empty details
-    return {}
+    lines = clean_text_lines(text)
+    return extract_fields(lines)
 
+# ========== OCR Verification Endpoint ==========
 @app.post("/verify")
 async def verify_document(file: UploadFile = File(...), doc_type: str = Form(...), user_input: str = Form(...)):
     try:
         with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as tmp:
-            content = await file.read()
-            tmp.write(content)
+            tmp.write(await file.read())
             tmp_path = tmp.name
 
-        # Preprocess image for better OCR
         img = cv2.imread(tmp_path)
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        
-        # Apply additional preprocessing for better OCR results
-        # 1. Noise reduction
         denoised = cv2.fastNlMeansDenoising(gray)
-        
-        # 2. Thresholding to get binary image
         _, thresh = cv2.threshold(denoised, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        
-        # 3. Morphological operations to remove noise
-        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
-        morph = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
-        
-        # Extract text from preprocessed image
+        morph = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, (2,2))
+
         text = pytesseract.image_to_string(morph)
-        
-        logging.info(f"OCR Text Extracted:\n{text}")
-        
-        # Extract only potential ID candidates (lines without extra text)
-        lines = [line.strip() for line in text.split("\n") if line.strip()]
-        
-        # Extract details from the document based on type
-        details = extract_details(text, doc_type)
-        
-        # Aadhaar Verification
+        lines = clean_text_lines(text)
+        details = extract_fields(lines)
+
         if doc_type.lower() == "aadhaar":
-            for line in lines:
-                # Remove spaces for comparison with user input
-                clean_line = line.replace(" ", "")
-                clean_user_input = user_input.replace(" ", "")
-                
-                if aadhaar_pattern.match(line) and clean_line == clean_user_input:
-                    return {
-                        "status": "Verified", 
-                        "feedback": f"Valid Aadhaar detected: {line}",
-                        "details": details
-                    }
-            return {"status": "Rejected", "feedback": "No valid Aadhaar number detected or mismatch with input"}
+            for l in lines:
+                if aadhaar_pattern.match(l) and l.replace(" ", "") == user_input.replace(" ", ""):
+                    return {"status": "Verified","feedback": f"Valid Aadhaar detected: {l}","details": details}
+            return {"status":"Rejected","feedback":"No valid Aadhaar number detected or mismatch"}
 
-        # PAN Verification
-        elif doc_type.lower() == "pan":
-            for line in lines:
-                if pan_pattern.match(line) and line == user_input:
-                    return {
-                        "status": "Verified", 
-                        "feedback": f"Valid PAN detected: {line}",
-                        "details": details  # Will be empty for PAN cards
-                    }
-            return {"status": "Rejected", "feedback": "No valid PAN number detected or mismatch with input"}
+        if doc_type.lower() == "pan":
+            for l in lines:
+                if pan_pattern.match(l) and l == user_input:
+                    return {"status": "Verified","feedback": f"Valid PAN detected: {l}","details": details}
+            return {"status":"Rejected","feedback":"No valid PAN number detected or mismatch"}
 
-        # APAAR Verification
-        elif doc_type.lower() == "apaar":
-            for line in lines:
-                # Remove any non-digit characters for APAAR
-                digits_only = re.sub(r'\D', '', line)
-                if apaar_pattern.match(digits_only) and digits_only == user_input:
-                    return {
-                        "status": "Verified", 
-                        "feedback": f"Valid APAAR ID detected: {digits_only}",
-                        "details": details
-                    }
-            return {"status": "Rejected", "feedback": "No valid APAAR ID detected or mismatch with input"}
+        if doc_type.lower() == "apaar":
+            for l in lines:
+                digits = re.sub(r'\D','',l)
+                if apaar_pattern.match(digits) and digits == user_input:
+                    return {"status": "Verified","feedback": f"Valid APAAR detected: {digits}","details": details}
+            return {"status":"Rejected","feedback":"No valid APAAR ID detected or mismatch"}
 
-        else:
-            return {"status": "Rejected", "feedback": "Unknown document type"}
-
+        return {"status": "Rejected", "feedback": "Unknown document type"}
     except Exception as e:
-        logging.error(f"Error verifying document: {e}")
         return {"status": "Rejected", "feedback": f"Server error: {str(e)}"}
+
+# ========== Chatbot Route ==========
+class ChatRequest(BaseModel):
+    messages: list
+
+@app.post("/api/chat")
+async def chatbot(req: ChatRequest):
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                headers={"Authorization": f"Bearer {os.getenv('GROQ_API_KEY')}", "Content-Type": "application/json"},
+                json={"model": "llama-3.1-8b-instant", "messages": req.messages},
+            )
+        return resp.json()
+    except Exception as e:
+        return {"error": f"Chatbot error: {str(e)}"}
+
+# ========== OTP Verification ==========
+active_user = None
+otp_store = {}
+
+def generate_otp():
+    return str(random.randint(100000, 999999))
+
+@app.middleware("http")
+async def one_user_lock(request: Request, call_next):
+    global active_user
+    client_ip = request.client.host
+    if active_user is None:
+        active_user = client_ip
+    if client_ip != active_user:
+        return JSONResponse(status_code=403, content={"error": "Verification locked. Only one person allowed."})
+    return await call_next(request)
+
+@app.post("/api/verify/aadhar")
+async def verify_aadhar(req: dict):
+    aadhar = req.get("aadharNumber")
+    if not aadhar or len(aadhar) != 12:
+        return {"error":"Invalid Aadhaar number"}
+    otp = generate_otp()
+    otp_store["aadhar"] = {"otp": otp, "verified": False}
+    print(f"📩 Aadhaar OTP for {aadhar}: {otp}")
+    return {"message": "OTP sent for Aadhaar verification"}
+
+@app.post("/api/verify/aadhar/otp")
+async def verify_aadhar_otp(req: dict):
+    otp = req.get("otp")
+    if otp_store.get("aadhar") and otp_store["aadhar"]["otp"] == otp:
+        otp_store["aadhar"]["verified"] = True
+        return {"message":"Aadhaar verified successfully ✅"}
+    return {"error":"Invalid OTP for Aadhaar ❌"}
+
+@app.post("/api/verify/pan")
+async def verify_pan(req: dict):
+    pan = req.get("panNumber")
+    if not pan or len(pan) != 10:
+        return {"error":"Invalid PAN number"}
+    otp = generate_otp()
+    otp_store["pan"] = {"otp": otp, "verified": False}
+    print(f"📩 PAN OTP for {pan}: {otp}")
+    return {"message":"OTP sent for PAN verification"}
+
+@app.post("/api/verify/pan/otp")
+async def verify_pan_otp(req: dict):
+    otp = req.get("otp")
+    if otp_store.get("pan") and otp_store["pan"]["otp"] == otp:
+        otp_store["pan"]["verified"] = True
+        return {"message":"PAN verified successfully ✅"}
+    return {"error":"Invalid OTP for PAN ❌"}
+
+@app.post("/api/verify/dl")
+async def verify_dl(req: dict):
+    dl = req.get("dlNumber")
+    if not dl or len(dl) < 8:
+        return {"error":"Invalid DL number"}
+    otp = generate_otp()
+    otp_store["dl"] = {"otp": otp, "verified": False}
+    print(f"📩 DL OTP for {dl}: {otp}")
+    return {"message":"OTP sent for DL verification"}
+
+@app.post("/api/verify/dl/otp")
+async def verify_dl_otp(req: dict):
+    otp = req.get("otp")
+    if otp_store.get("dl") and otp_store["dl"]["otp"] == otp:
+        otp_store["dl"]["verified"] = True
+        return {"message":"Driving License verified successfully ✅"}
+    return {"error":"Invalid OTP for DL ❌"}
+
+@app.post("/api/reset-verification")
+async def reset_verification():
+    global active_user, otp_store
+    active_user = None
+    otp_store = {}
+    return {"message":"Verification system reset. Next person can verify now."}

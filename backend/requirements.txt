@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+pytesseract
+pillow
+opencv-python
+python-dotenv
+httpx
+cryptography

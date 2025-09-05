@@ -111,7 +111,7 @@ const UploadDocuments = () => {
     formData.append("doc_type", docType);
     formData.append("user_input", userInput);
 
-    const res = await fetch("http://127.0.0.1:8000/verify", {
+    const res = await fetch(`${import.meta.env.VITE_API_URL}/verify`, {
       method: "POST",
       body: formData
     });
